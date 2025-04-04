@@ -1,5 +1,5 @@
 # Triton Cache Tracker (TCT)
-NOTE: IT IS A WIP PROJECT AND AT THE MOMENT IT WORKS ONLY FOR CUDA
+NOTE: IT IS A WIP PROJECT TESTED WITH TRITON 3.3.0
 
 A lightweight utility for monitoring and analyzing Triton kernel compilation cache behavior.
 

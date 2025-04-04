@@ -3,7 +3,7 @@
 Triton Cache Tracker - A utility for monitoring and analyzing Triton kernel compilation cache.
 
 This module provides tools to track cache hits/misses and analyze kernel compilation details
-by hooking into Triton's JIT compilation process.
+by hooking into Triton's JIT compilation process, supporting both NVIDIA (CUDA) and AMD (HIP).
 """
 
 import ast
@@ -13,6 +13,7 @@ import os
 import re
 from functools import wraps
 from pathlib import Path
+from typing import Tuple
 
 from triton._C.libtriton import get_cache_invalidating_env_vars
 from triton._utils import find_paths_if, get_iterable_path
@@ -62,12 +63,30 @@ def parse_options_dict_from_compile_key(compile_key: str) -> dict:
     return ast.literal_eval(dict_str)
 
 
-def format_metadata_as_cuda_options(metadata):
+def file_hash(path):
     """
-    Convert KernelMetadata to a CUDAOptions-style string representation.
+    Compute SHA256 hash of a file, replicating Triton's file hashing.
     
     Args:
-        metadata: The kernel metadata object
+        path: Path to the file to hash
+        
+    Returns:
+        str: Hexadecimal hash value
+    """
+    with open(path, "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()
+
+
+#
+# ------------------- CUDA-SPECIFIC OPTIONS FORMATTING AND HASHING -------------------
+#
+
+def format_metadata_as_cuda_options(metadata):
+    """
+    Convert CUDA KernelMetadata to a CUDAOptions-style string representation.
+    
+    Args:
+        metadata: The kernel metadata object (CUDA)
         
     Returns:
         str: A formatted string representing the CUDA options
@@ -95,26 +114,12 @@ def format_metadata_as_cuda_options(metadata):
     return f"CUDAOptions({', '.join(opts)})"
 
 
-def file_hash(path):
-    """
-    Compute SHA256 hash of a file, replicating Triton's file hashing.
-    
-    Args:
-        path: Path to the file to hash
-        
-    Returns:
-        str: Hexadecimal hash value
-    """
-    with open(path, "rb") as f:
-        return hashlib.sha256(f.read()).hexdigest()
-
-
 def get_cudaoptions_hash(metadata):
     """
     Replicate Triton's CUDAOptions hash computation.
     
     Args:
-        metadata: The kernel metadata object
+        metadata: The kernel metadata object (CUDA)
         
     Returns:
         str: Hexadecimal hash value
@@ -148,12 +153,139 @@ def get_cudaoptions_hash(metadata):
         "supported_fp8_dtypes": tuple(metadata.supported_fp8_dtypes),
     }
     
-    # Generate hash key exactly as CUDAOptions.hash() does
     sorted_items = sorted(hash_dict.items(), key=lambda x: x[0])
     key = "_".join([f"{name}-{val}" for name, val in sorted_items])
     
     return hashlib.sha256(key.encode("utf-8")).hexdigest()
 
+
+#
+# ------------------- HIP-SPECIFIC OPTIONS FORMATTING AND HASHING -------------------
+#
+
+def format_metadata_as_hip_options(metadata):
+    """
+    Convert HIP KernelMetadata to a HIPOptions-style string 
+    """
+    extern_libs_tuple = tuple(tuple(x) for x in metadata.extern_libs)
+
+    opts = [
+        f"num_warps={metadata.num_warps}",
+        f"waves_per_eu={metadata.waves_per_eu}",
+        f"num_stages={metadata.num_stages}",
+        f"num_ctas={metadata.num_ctas}",
+        f"num_buffers_warp_spec={getattr(metadata, 'num_buffers_warp_spec', 0)}",
+        f"num_consumer_groups={getattr(metadata, 'num_consumer_groups', 0)}",
+        f"reg_dec_producer={getattr(metadata, 'reg_dec_producer', 0)}",
+        f"reg_inc_consumer={getattr(metadata, 'reg_inc_consumer', 0)}",
+        f"extern_libs={extern_libs_tuple}",
+        f"cluster_dims={metadata.cluster_dims}",
+        f"debug={metadata.debug}",
+        f"sanitize_overflow={metadata.sanitize_overflow}",
+        f"arch={metadata.arch!r}",
+        f"supported_fp8_dtypes={tuple(metadata.supported_fp8_dtypes)}",
+        f"deprecated_fp8_dtypes={tuple(metadata.deprecated_fp8_dtypes)}",
+        f"default_dot_input_precision={metadata.default_dot_input_precision!r}",
+        f"allowed_dot_input_precisions={tuple(metadata.allowed_dot_input_precisions)}",
+        f"enable_fp_fusion={metadata.enable_fp_fusion}",
+        f"launch_cooperative_grid={metadata.launch_cooperative_grid}",
+        f"matrix_instr_nonkdim={metadata.matrix_instr_nonkdim}",
+        f"kpack={metadata.kpack}",
+        f"allow_flush_denorm={metadata.allow_flush_denorm}",
+        f"max_num_imprecise_acc_default={metadata.max_num_imprecise_acc_default}",
+        f"backend_name={metadata.backend_name!r}",
+        f"instruction_sched_variant={metadata.instruction_sched_variant!r}",
+    ]
+    
+    return f"HIPOptions({', '.join(opts)})"
+
+
+def get_hipoptions_hash(metadata):
+    """
+    Replicate Triton's HIPOptions hash computation.
+    
+    Args:
+        metadata: The kernel metadata object (HIP)
+        
+    Returns:
+        str: Hexadecimal hash value
+    """
+
+    extern_libs = tuple(tuple(x) for x in getattr(metadata, 'extern_libs', ()))
+
+    fields = [
+        ("num_warps", getattr(metadata, 'num_warps', 4)),
+        ("waves_per_eu", getattr(metadata, 'waves_per_eu', 2)),
+        ("num_stages", getattr(metadata, 'num_stages', 2)),
+        ("num_ctas", getattr(metadata, 'num_ctas', 1)),
+        ("num_buffers_warp_spec", getattr(metadata, 'num_buffers_warp_spec', 0)),
+        ("num_consumer_groups", getattr(metadata, 'num_consumer_groups', 0)),
+        ("reg_dec_producer", getattr(metadata, 'reg_dec_producer', 0)),
+        ("reg_inc_consumer", getattr(metadata, 'reg_inc_consumer', 0)),
+        ("extern_libs", extern_libs),
+        ("cluster_dims", getattr(metadata, 'cluster_dims', (1,1,1))),
+        ("debug", getattr(metadata, 'debug', False)),
+        ("sanitize_overflow", getattr(metadata, 'sanitize_overflow', True)),
+        ("arch", getattr(metadata, 'arch', 'gfx90a')), # ToDo @fulvius31 check if this value can be None
+        ("supported_fp8_dtypes", tuple(getattr(metadata, 'supported_fp8_dtypes', ('fp8e5',)))),
+        ("deprecated_fp8_dtypes", tuple(getattr(metadata, 'deprecated_fp8_dtypes', ()))),
+        ("default_dot_input_precision", getattr(metadata, 'default_dot_input_precision', 'ieee')),
+        ("allowed_dot_input_precisions", tuple(getattr(metadata, 'allowed_dot_input_precisions', ('ieee',)))),
+        ("enable_fp_fusion", getattr(metadata, 'enable_fp_fusion', True)),
+        ("launch_cooperative_grid", getattr(metadata, 'launch_cooperative_grid', False)),
+        ("matrix_instr_nonkdim", getattr(metadata, 'matrix_instr_nonkdim', 0)),
+        ("kpack", getattr(metadata, 'kpack', 1)),
+        ("allow_flush_denorm", getattr(metadata, 'allow_flush_denorm', False)),
+        ("max_num_imprecise_acc_default", getattr(metadata, 'max_num_imprecise_acc_default', 0)),
+        ("backend_name", getattr(metadata, 'backend_name', 'hip')),
+        ("instruction_sched_variant", getattr(metadata, 'instruction_sched_variant', 'none')),
+        ("warp_size", getattr(metadata, 'warp_size', 64)),
+    ]
+
+
+    def str_val(val):
+        return str(val)
+
+    key_parts = [f"{k}-{str_val(v)}" for (k, v) in fields]
+    key = "_".join(key_parts)
+
+    import hashlib
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()
+
+
+#
+# ------------------- BACKEND-AGNOSTIC HELPERS -------------------
+#
+
+def format_metadata_as_backend_options(metadata):
+    """
+    Switch to the appropriate backend's string formatter (CUDA or HIP).
+    """
+    backend = getattr(metadata, "backend_name", None)
+    if backend == "cuda":
+        return format_metadata_as_cuda_options(metadata)
+    elif backend == "hip":
+        return format_metadata_as_hip_options(metadata)
+    else:
+        return f"UnknownBackendOptions(backend_name={backend})"
+
+
+def get_backend_options_hash(metadata):
+    """
+    Switch to the appropriate backend's hashing function (CUDA or HIP).
+    """
+    backend = getattr(metadata, "backend_name", None)
+    if backend == "cuda":
+        return get_cudaoptions_hash(metadata)
+    elif backend == "hip":
+        return get_hipoptions_hash(metadata)
+    else:
+        return hashlib.sha256(str(backend).encode("utf-8")).hexdigest()
+
+
+#
+# ------------------- TRITON CACHE TRACKER -------------------
+#
 
 def serialize_specialization_data(name, signature, constants, attrs, options, key):
     """
@@ -170,14 +302,15 @@ def serialize_specialization_data(name, signature, constants, attrs, options, ke
     Returns:
         str: JSON-encoded specialization data
     """
-    # Convert KernelMetadata to CUDAOptions-like structure
+    # Convert KernelMetadata to a backend-options-like structure including HIP and CUDA fields
     filtered_options = {
         'num_warps': options.num_warps,
-        'num_ctas': options.num_ctas,
+        'num_ctas': getattr(options, 'num_ctas', None),
+        'waves_per_eu': getattr(options, 'waves_per_eu', None),
         'num_stages': options.num_stages,
-        'maxnreg': options.maxnreg,
+        'maxnreg': getattr(options, 'maxnreg', None),
         'cluster_dims': options.cluster_dims,
-        'ptx_version': options.ptx_version,
+        'ptx_version': getattr(options, 'ptx_version', None),
         'enable_fp_fusion': options.enable_fp_fusion,
         'launch_cooperative_grid': options.launch_cooperative_grid,
         'supported_fp8_dtypes': tuple(options.supported_fp8_dtypes),
@@ -189,7 +322,11 @@ def serialize_specialization_data(name, signature, constants, attrs, options, ke
         'debug': options.debug,
         'backend_name': options.backend_name,
         'sanitize_overflow': options.sanitize_overflow,
-        'arch': options.arch
+        'arch': options.arch,
+        'matrix_instr_nonkdim': getattr(options, 'matrix_instr_nonkdim', None),
+        'kpack': getattr(options, 'kpack', None),
+        'allow_flush_denorm': getattr(options, 'allow_flush_denorm', None),
+        'instruction_sched_variant': getattr(options, 'instruction_sched_variant', None),
     }
 
     constants_processed = {
@@ -310,8 +447,10 @@ class TritonCacheTracker:
         
         backend_obj = make_backend(kernel.metadata.target)
         backend_hash_str = str(backend_obj.hash())
-        options_str = format_metadata_as_cuda_options(kernel.metadata)
-        options_hash = get_cudaoptions_hash(kernel.metadata)
+
+        # backend-agnostic approach
+        options_str = format_metadata_as_backend_options(kernel.metadata)
+        options_hash = get_backend_options_hash(kernel.metadata)
         
         env_vars = get_cache_invalidating_env_vars()
         env_vars_str = str(sorted(env_vars.items()))
@@ -360,7 +499,7 @@ class TritonCacheTracker:
             module = self_jit.fn.__module__
             arg_reprs = ", ".join([f"{p.name}: {ty}" for p, ty in zip(self_jit.params, key[1])])
             repr_str = (
-                f"{name}[num_warps={options.num_warps}, num_ctas={options.num_ctas}, "
+                f"{name}[num_warps={options.num_warps}, num_ctas={getattr(options, 'num_ctas', None)}, "
                 f"num_stages={options.num_stages}, enable_fp_fusion={options.enable_fp_fusion}, "
                 f"launch_cooperative_grid={options.launch_cooperative_grid}]({arg_reprs})"
             )
@@ -375,7 +514,7 @@ class TritonCacheTracker:
                 "device": device,
                 "constants": constants,
                 "num_warps": options.num_warps,
-                "num_ctas": options.num_ctas,
+                "num_ctas": getattr(options, 'num_ctas', None),
                 "num_stages": options.num_stages,
                 "enable_fp_fusion": options.enable_fp_fusion,
                 "launch_cooperative_grid": options.launch_cooperative_grid,
