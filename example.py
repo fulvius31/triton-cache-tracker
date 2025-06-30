@@ -1,8 +1,6 @@
 import triton
 from triton_cache_manager_tracker import TrackingCacheManager, _tracker
 import torch
-
-triton.knobs.cache.manager_class = TrackingCacheManager
 import triton.language as tl
 
 
